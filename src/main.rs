@@ -1,10 +1,12 @@
 use chrono::DateTime;
 use clap::{App, Arg};
-use failure::Error;
+use failure::{format_err, Error};
 use jsl::{Form, Schema, Type};
-use serde_json::Value;
 
+use json_pointer::JsonPointer;
+use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::stdin;
 use std::io::BufRead;
@@ -20,6 +22,20 @@ fn main() -> Result<(), Error> {
                 .help("Where to read examples from. Dash (hypen) indicates stdin")
                 .default_value("-"),
         )
+        .arg(
+            Arg::with_name("values-hint")
+                .help("Advise the inferrer that the given path points to a values form. If this hint is proven wrong, a properties form will be emitted instead. This flag can be provided multiple times.")
+                .multiple(true)
+                .number_of_values(1)
+                .long("values-hint"),
+        )
+        .arg(
+            Arg::with_name("discriminator-hint")
+                .help("Advise the inferrer that the given path points to a discriminator tag. If this hint is proven wrong, an empty form will be emitted instead. This flag can be provided multiple times.")
+                .multiple(true)
+                .number_of_values(1)
+                .long("discriminator-hint"),
+        )
         .get_matches();
 
     let reader = BufReader::new(match matches.value_of("INPUT").unwrap() {
@@ -27,15 +43,87 @@ fn main() -> Result<(), Error> {
         file @ _ => Box::new(File::open(file)?) as Box<Read>,
     });
 
+    let mut hints = InferHints::new();
+    for hint in matches.values_of("values-hint").unwrap_or_default() {
+        let mut ptr: JsonPointer<String, Vec<String>> = hint
+            .parse()
+            .map_err(|e| format_err!("cannot parse as JSON Pointer: {:?}", e))?;
+
+        // A bit of a hack: the json-pointer crate does not support just getting
+        // the components. So we instead pop them out and put them into a deque.
+        let mut path = VecDeque::new();
+        while let Some(tok) = ptr.pop() {
+            path.push_front(tok);
+        }
+
+        hints.add_values_hint(path.as_slices().0);
+    }
+
+    for hint in matches.values_of("discriminator-hint").unwrap_or_default() {
+        let mut ptr: JsonPointer<String, Vec<String>> = hint
+            .parse()
+            .map_err(|e| format_err!("cannot parse as JSON Pointer: {:?}", e))?;
+
+        // See note above regarding why we are doing this popping.
+        let mut path = VecDeque::new();
+        while let Some(tok) = ptr.pop() {
+            path.push_front(tok);
+        }
+
+        let path = path.as_slices().0;
+        let (tag, discriminator_path) = path.split_last().unwrap();
+
+        hints.add_discriminator_hint(discriminator_path, tag.clone());
+    }
+
     let mut inference = InferredSchema::Unknown;
     for line in reader.lines() {
-        inference = inference.infer(serde_json::from_str(&line?)?);
+        inference = inference.infer(serde_json::from_str(&line?)?, Some(&hints));
     }
 
     let serde_schema = inference.into_schema().into_serde();
     println!("{}", serde_json::to_string(&serde_schema)?);
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct InferHints {
+    values: bool,
+    discriminator_tag: Option<String>,
+    children: HashMap<String, InferHints>,
+}
+
+impl InferHints {
+    fn new() -> InferHints {
+        InferHints {
+            values: false,
+            discriminator_tag: None,
+            children: HashMap::new(),
+        }
+    }
+
+    fn add_values_hint(&mut self, path: &[String]) {
+        if path.is_empty() {
+            self.values = true;
+        } else {
+            self.children
+                .entry(path[0].clone())
+                .or_insert(InferHints::new())
+                .add_values_hint(&path[1..]);
+        }
+    }
+
+    fn add_discriminator_hint(&mut self, path: &[String], tag: String) {
+        if path.is_empty() {
+            self.discriminator_tag = Some(tag);
+        } else {
+            self.children
+                .entry(path[0].clone())
+                .or_insert(InferHints::new())
+                .add_discriminator_hint(&path[1..], tag);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +136,8 @@ enum InferredSchema {
     String,
     Array(Box<InferredSchema>),
     Properties(Box<InferredProperties>),
+    Values(Box<InferredSchema>),
+    Discriminator(String, HashMap<String, InferredSchema>),
 }
 
 #[derive(Debug)]
@@ -57,7 +147,7 @@ struct InferredProperties {
 }
 
 impl InferredSchema {
-    fn infer(self, value: Value) -> InferredSchema {
+    fn infer(self, value: Value, hints: Option<&InferHints>) -> InferredSchema {
         match (self, value) {
             (InferredSchema::Unknown, Value::Null) => InferredSchema::Any,
             (InferredSchema::Unknown, Value::Bool(_)) => InferredSchema::Bool,
@@ -72,15 +162,39 @@ impl InferredSchema {
             (InferredSchema::Unknown, Value::Array(vals)) => {
                 let mut sub_infer = InferredSchema::Unknown;
                 for v in vals {
-                    sub_infer = sub_infer.infer(v);
+                    sub_infer = sub_infer.infer(v, hints.and_then(|h| h.children.get("-")));
                 }
 
                 InferredSchema::Array(Box::new(sub_infer))
             }
-            (InferredSchema::Unknown, Value::Object(map)) => {
+            (InferredSchema::Unknown, Value::Object(mut map)) => {
+                if let Some(ref hint) = hints {
+                    if hint.values {
+                        let mut sub_infer = InferredSchema::Unknown;
+                        for (k, v) in map {
+                            sub_infer = InferredSchema::Unknown
+                                .infer(v, hints.and_then(|h| h.children.get(&k)));
+                        }
+
+                        return InferredSchema::Values(Box::new(sub_infer));
+                    } else if let Some(ref tag) = hint.discriminator_tag {
+                        if let Some(Value::String(mapping_key)) = map.remove(tag) {
+                            let infer_rest =
+                                InferredSchema::Unknown.infer(Value::Object(map), hints);
+
+                            let mut mapping = HashMap::new();
+                            mapping.insert(mapping_key.to_owned(), infer_rest);
+
+                            return InferredSchema::Discriminator(tag.to_owned(), mapping);
+                        }
+                    }
+                }
+
                 let mut props = HashMap::new();
                 for (k, v) in map {
-                    props.insert(k, InferredSchema::Unknown.infer(v));
+                    let sub_infer =
+                        InferredSchema::Unknown.infer(v, hints.and_then(|h| h.children.get(&k)));
+                    props.insert(k, sub_infer);
                 }
 
                 InferredSchema::Properties(Box::new(InferredProperties {
@@ -106,7 +220,7 @@ impl InferredSchema {
             (InferredSchema::Array(prior), Value::Array(vals)) => {
                 let mut sub_infer = *prior;
                 for v in vals {
-                    sub_infer = sub_infer.infer(v);
+                    sub_infer = sub_infer.infer(v, hints.and_then(|h| h.children.get("-")));
                 }
 
                 InferredSchema::Array(Box::new(sub_infer))
@@ -120,25 +234,70 @@ impl InferredSchema {
                     .cloned()
                     .collect();
                 for k in missing_required_keys {
-                    let sub_prior = prior.required.remove(&k).unwrap();
-                    prior.optional.insert(k, sub_prior);
+                    let sub_infer = prior.required.remove(&k).unwrap();
+                    prior.optional.insert(k, sub_infer);
                 }
 
                 for (k, v) in map {
                     if prior.required.contains_key(&k) {
-                        let sub_prior = prior.required.remove(&k).unwrap().infer(v);
-                        prior.required.insert(k, sub_prior);
+                        let sub_infer = prior
+                            .required
+                            .remove(&k)
+                            .unwrap()
+                            .infer(v, hints.and_then(|h| h.children.get(&k)));
+                        prior.required.insert(k, sub_infer);
                     } else if prior.optional.contains_key(&k) {
-                        let sub_prior = prior.optional.remove(&k).unwrap().infer(v);
-                        prior.optional.insert(k, sub_prior);
+                        let sub_infer = prior
+                            .optional
+                            .remove(&k)
+                            .unwrap()
+                            .infer(v, hints.and_then(|h| h.children.get(&k)));
+                        prior.optional.insert(k, sub_infer);
                     } else {
-                        prior.optional.insert(k, InferredSchema::Unknown.infer(v));
+                        let sub_infer = InferredSchema::Unknown
+                            .infer(v, hints.and_then(|h| h.children.get(&k)));
+                        prior.optional.insert(k, sub_infer);
                     }
                 }
 
                 InferredSchema::Properties(prior)
             }
             (InferredSchema::Properties(_), _) => InferredSchema::Any,
+            (InferredSchema::Values(prior), Value::Object(map)) => {
+                let mut sub_infer = *prior;
+                for (k, v) in map {
+                    sub_infer =
+                        InferredSchema::Unknown.infer(v, hints.and_then(|h| h.children.get(&k)));
+                }
+
+                return InferredSchema::Values(Box::new(sub_infer));
+            }
+            (InferredSchema::Values(_), _) => InferredSchema::Any,
+            (InferredSchema::Discriminator(tag, mut mapping), Value::Object(mut map)) => {
+                let mapping_key = map.remove(&tag);
+                if let Some(Value::String(mapping_key_str)) = mapping_key {
+                    if !mapping.contains_key(&mapping_key_str) {
+                        mapping.insert(mapping_key_str.clone(), InferredSchema::Unknown);
+                    }
+
+                    let sub_infer = mapping
+                        .remove(&mapping_key_str)
+                        .unwrap()
+                        .infer(Value::Object(map), hints);
+                    mapping.insert(mapping_key_str, sub_infer);
+
+                    InferredSchema::Discriminator(tag, mapping)
+                } else {
+                    // The hint was wrong. Retroactively re-computing a
+                    // properties form is quite complex, and ultimately the user
+                    // is likely going to be disappointed either way.
+                    //
+                    // So to keep this error condition simple, we simply
+                    // downgrade to "any".
+                    InferredSchema::Any
+                }
+            }
+            (InferredSchema::Discriminator(_, _), _) => InferredSchema::Any,
         }
     }
 
@@ -150,7 +309,7 @@ impl InferredSchema {
             InferredSchema::Number => Form::Type(Type::Number),
             InferredSchema::String => Form::Type(Type::String),
             InferredSchema::Timestamp => Form::Type(Type::Timestamp),
-            InferredSchema::Array(sub_prior) => Form::Elements(sub_prior.into_schema()),
+            InferredSchema::Array(sub_infer) => Form::Elements(sub_infer.into_schema()),
             InferredSchema::Properties(props) => {
                 let has_required = !props.required.is_empty();
 
@@ -168,6 +327,14 @@ impl InferredSchema {
                     has_required,
                 )
             }
+            InferredSchema::Values(sub_infer) => Form::Values(sub_infer.into_schema()),
+            InferredSchema::Discriminator(tag, mapping) => Form::Discriminator(
+                tag,
+                mapping
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_schema()))
+                    .collect(),
+            ),
         };
 
         Schema::from_parts(None, Box::new(form), HashMap::new())
