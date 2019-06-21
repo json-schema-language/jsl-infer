@@ -5,3 +5,9 @@ authors = ["Ulysse Carion <ulysse@segment.com>"]
 edition = "2018"
 
 [dependencies]
+clap = "2.33"
+jsl = "0.2.3"
+serde_json = "1.0"
+failure = "0.1"
+rand = "0.6"
+chrono = "0.4"
